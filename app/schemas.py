@@ -8,6 +8,18 @@ BATCH_MAX_SIZE = 32
 
 TaskKey = Annotated[str, Field(min_length=1, max_length=512)]
 
+# 幂等键：仅允许 URL/Header 安全字符，便于客户端通过日志 / 链路追踪传递
+REQUEST_ID_PATTERN = r"^[A-Za-z0-9._:-]+$"
+RequestId = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=128,
+        pattern=REQUEST_ID_PATTERN,
+        examples=["req-7f3a2c91"],
+    ),
+]
+
 
 class AcquireRequest(BaseModel):
     task_key: str = Field(
@@ -128,6 +140,15 @@ class LimitCheckRequest(BaseModel):
         examples=["tenant-42:send-sms"],
         description="限流对象标识（租户 / 用户 / API 等任意维度）",
     )
+    request_id: RequestId | None = Field(
+        default=None,
+        description=(
+            "可选幂等标识。同一 client_key + 同一 request_id 在其首次请求的"
+            "窗口内只扣减一次：后续携带该标识的并发 / 重试请求直接返回首次"
+            "判定结果（200 或 429）。窗口结束后标识自动失效，可再次使用。"
+            "不传时行为与旧版本完全一致（每次请求正常判定扣减）。"
+        ),
+    )
     limit: int = Field(
         ge=1,
         le=1_000_000_000,
@@ -157,6 +178,17 @@ class LimitCheckRequest(BaseModel):
 class LimitCheckResponse(BaseModel):
     allowed: bool = Field(description="是否放行（false 时 HTTP 状态码为 429）")
     client_key: str
+    request_id: str | None = Field(
+        default=None,
+        description="回显请求携带的幂等标识；未携带时为 null",
+    )
+    idempotent_replay: bool = Field(
+        default=False,
+        description=(
+            "true 表示本次响应直接取自同一 request_id 的首次判定结果"
+            "（未重复扣减）；响应头同时给出 Idempotent-Replay: true"
+        ),
+    )
     limit: int = Field(description="窗口内允许的成本上限")
     window_ms: int = Field(description="本次判定使用的滑动窗口长度（毫秒）")
     remaining: int = Field(

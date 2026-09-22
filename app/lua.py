@@ -13,8 +13,11 @@
 - 限流键是一个 ZSet：score 为请求时刻（Redis 服务器毫秒），
   member 形如 "<uuid>:<cost>"，cost 编码在 member 尾部，
   uuid 保证同毫秒并发请求的 member 不冲突。
-- 窗口判断、累计、扣减全部基于 redis.call('TIME') 的服务器时间，
-  单脚本原子执行，并发请求不会超额。
+- 幂等键（可选 request_id）是一个 Hash，保存首次判定的完整响应，
+  TTL 等于首次请求的 window_ms：窗口内同键请求直接回放首次结果、
+  不重复扣减；窗口结束后 Hash 自动删除，request_id 可再次使用。
+- 窗口判断、累计、扣减与幂等判定全部基于 redis.call('TIME') 的
+  服务器时间，单脚本原子执行，并发请求不会超额、不会重复扣减。
 """
 
 # 申请租约：仅当租约不存在或已过期时成功。
@@ -158,25 +161,46 @@ end
 return {1, expires_at - now}
 """
 
-# 滑动窗口限流（成本累计）：原子完成"清旧 -> 累计 -> 判定 -> 扣减"。
+# 滑动窗口限流（成本累计）+ 可选请求幂等：单脚本原子完成
+# "幂等命中判定 -> 清旧 -> 累计 -> 判定 -> 扣减 -> 记录完整响应"。
 # 限流键是一个 ZSet：score 为请求时刻（Redis 服务器毫秒），
 # member 形如 "<唯一标识>:<cost>"，同一毫秒内的并发请求也不会互相覆盖；
 # 每笔成本直接编码在 member 尾部，无需额外的键。
+# 幂等键是一个 Hash（仅携带 request_id 时传入 KEYS[2]）：
+#   allowed / remaining / reset_at / retry_after / limit / window
+# 保存首次请求的完整判定结果，PEXPIRE = 首次请求的 window_ms，
+# 因此 request_id 仅在对应窗口内存活，窗口结束后自动删除、可被再次使用；
+# Redis 单线程执行脚本，携带相同 request_id 的并发请求也只有一个完成扣减。
 # KEYS[1] = 限流 ZSet 键
+# KEYS[2] = 幂等 Hash 键（可选；未携带 request_id 时不传入）
 # ARGV[1] = limit（窗口内允许的成本上限）
 # ARGV[2] = window_ms
 # ARGV[3] = cost（本次请求成本）
 # ARGV[4] = 唯一标识（uuid hex，保证 member 不冲突）
-# 放行返回 {1, remaining, reset_at_ms}
-# 超限返回 {0, remaining, reset_at_ms, retry_after_ms}
+# 幂等命中返回 {2, allowed, remaining, reset_at, retry_after, limit, window}
+#   （直接回传首次结果，不清理 / 不判定 / 不扣减 / 不刷新任何 TTL）
+# 首次放行返回 {1, remaining, reset_at_ms}
+# 首次超限返回 {0, remaining, reset_at_ms, retry_after_ms}
 # reset_at_ms 为窗口内最老一笔成本滑出的时刻；窗口为空时取 now + window_ms。
 LIMIT_CHECK_LUA = """
+local key = KEYS[1]
+
+-- 幂等命中：原样返回首次请求记录的完整判定结果
+if #KEYS >= 2 then
+  local stored = redis.call('HMGET', KEYS[2],
+    'allowed', 'remaining', 'reset_at', 'retry_after', 'limit', 'window')
+  if stored[1] then
+    return {2,
+      tonumber(stored[1]), tonumber(stored[2]), tonumber(stored[3]),
+      tonumber(stored[4]), tonumber(stored[5]), tonumber(stored[6])}
+  end
+end
+
 local t = redis.call('TIME')
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local limit = tonumber(ARGV[1])
 local window = tonumber(ARGV[2])
 local cost = tonumber(ARGV[3])
-local key = KEYS[1]
 
 local window_start = now - window
 
@@ -198,12 +222,35 @@ else
   reset_at = tonumber(oldest[2]) + window
 end
 
+local allowed, remaining, retry_after
 if used + cost > limit then
-  return {0, limit - used, reset_at, reset_at - now}
+  allowed = 0
+  remaining = limit - used
+  retry_after = reset_at - now
+else
+  allowed = 1
+  remaining = limit - used - cost
+  retry_after = 0
+  redis.call('ZADD', key, now, ARGV[4] .. ':' .. cost)
+end
+redis.call('PEXPIRE', key, window)
+
+-- 首次请求：连同 limit / window 一起记录完整响应，TTL = window_ms，
+-- 使 request_id 恰好存活到该窗口结束
+if #KEYS >= 2 then
+  redis.call('HSET', KEYS[2],
+    'allowed', allowed,
+    'remaining', remaining,
+    'reset_at', reset_at,
+    'retry_after', retry_after,
+    'limit', limit,
+    'window', window)
+  redis.call('PEXPIRE', KEYS[2], window)
 end
 
-redis.call('ZADD', key, now, ARGV[4] .. ':' .. cost)
-redis.call('PEXPIRE', key, window)
-return {1, limit - used - cost, reset_at}
+if allowed == 1 then
+  return {1, remaining, reset_at}
+end
+return {0, remaining, reset_at, retry_after}
 """
 

@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     )
     # 限流键前缀，与租约键前缀隔离，便于多环境共用一个实例
     limit_key_prefix: str = Field(default="ratelimit", validation_alias="LIMIT_KEY_PREFIX")
+    # 限流幂等记录键前缀，与限流 ZSet 键隔离
+    # （幂等记录为 Hash，键名采用长度定界，不同 client_key 间不可能碰撞）
+    limit_idem_key_prefix: str = Field(
+        default="ratelimit-idem", validation_alias="LIMIT_IDEM_KEY_PREFIX"
+    )
     # window_ms 合法区间（毫秒），超出范围的限流请求会被拒绝
     limits_min_window_ms: int = Field(
         default=1, validation_alias="LIMITS_MIN_WINDOW_MS"

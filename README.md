@@ -8,7 +8,9 @@
 另提供 **Redis Lua 原子滑动窗口（成本）限流 API**：`POST /v1/limits/check`
 按 Redis 服务器时间累计滑动窗口内的请求成本，未超限则原子扣减并返回剩余额度，
 超限返回 `429` 与建议重试时间；同一 `client_key` 的并发请求不会超额，过期窗口
-数据自动清理。
+数据自动清理。请求还可携带可选 `request_id` 实现**窗口内请求幂等**：相同
+`client_key` + `request_id` 的并发或重试请求直接返回首次判定结果且不重复扣减，
+`request_id` 仅在对应窗口内存活，跨窗口可再次使用。
 
 技术栈：Python 3.12 · FastAPI · Redis 7（Lua 脚本保证原子性）
 
@@ -41,6 +43,7 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | `LEASE_MAX_TTL_MS` | `300000` | 允许的最大 TTL（毫秒） |
 | `LEASE_DEFAULT_TTL_MS` | `10000` | 请求未指定 `ttl_ms` 时的默认值 |
 | `LIMIT_KEY_PREFIX` | `ratelimit` | 限流 Redis 键前缀，与租约键隔离 |
+| `LIMIT_IDEM_KEY_PREFIX` | `ratelimit-idem` | 限流幂等记录 Redis 键前缀，与限流 ZSet 隔离 |
 | `LIMITS_MIN_WINDOW_MS` | `1` | 允许的最小限流窗口（毫秒） |
 | `LIMITS_MAX_WINDOW_MS` | `86400000` | 允许的最大限流窗口（毫秒，默认 1 天） |
 
@@ -58,7 +61,7 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | POST | `/v1/leases/release` | 释放租约（幂等，始终 200） |
 | POST | `/v1/leases/validate` | 校验 (令牌, 防栅序号) 是否仍属当前租约 |
 | GET | `/v1/leases/{task_key}` | 查看任务键租约状态（不暴露令牌） |
-| POST | `/v1/limits/check` | 滑动窗口成本限流检查（通过即扣减），放行 200 / 超限 429 |
+| POST | `/v1/limits/check` | 滑动窗口成本限流检查（通过即扣减，可选 `request_id` 幂等），放行 200 / 超限 429 |
 | GET | `/healthz` | 健康检查 |
 
 ### 示例
@@ -132,6 +135,31 @@ curl -s -X POST localhost:8000/v1/limits/check \
   -H 'Content-Type: application/json' \
   -d '{"client_key": "tenant-42:bulk", "limit": 100, "window_ms": 60000, "cost": 30}'
 # => 200 {"allowed":true,...,"remaining":70,...}
+
+# request_id 幂等：相同 client_key + request_id 在窗口内只扣减一次。
+# 首次请求正常判定（假设通过）：
+curl -s -X POST localhost:8000/v1/limits/check \
+  -H 'Content-Type: application/json' \
+  -d '{"client_key": "tenant-42:send-sms", "request_id": "req-7f3a2c91",
+       "limit": 3, "window_ms": 1000, "cost": 1}'
+# => 200
+# {"allowed":true,...,"request_id":"req-7f3a2c91","idempotent_replay":false,
+#  "remaining":2,...}
+
+# 网络超时 / 客户端重试，携带相同 request_id 再发一次：
+# 直接回放首次结果，不再扣减（即使窗口额度已被其他请求占满）：
+curl -i -X POST localhost:8000/v1/limits/check \
+  -H 'Content-Type: application/json' \
+  -d '{"client_key": "tenant-42:send-sms", "request_id": "req-7f3a2c91",
+       "limit": 3, "window_ms": 1000, "cost": 1}'
+# => HTTP/1.1 200 OK
+#    Idempotent-Replay: true
+# {"allowed":true,...,"request_id":"req-7f3a2c91","idempotent_replay":true,
+#  "remaining":2,...}            # 与首次完全一致，窗口内实际只扣了一笔
+
+# 首次判定为 429 时同样会记录：重试得到相同的 429 快照（同 reset_at_ms /
+# retry_after_ms），不会因为时间推移或参数变化重新判定；
+# 待窗口结束、request_id 自动失效后，同一 request_id 可再次用于新请求。
 ```
 
 字段说明：
@@ -139,10 +167,13 @@ curl -s -X POST localhost:8000/v1/limits/check \
 | 字段 | 方向 | 说明 |
 | --- | --- | --- |
 | `client_key` | 请求 | 限流对象标识（1～512 字符），任意维度（租户 / 用户 / API） |
+| `request_id` | 请求 | 可选幂等标识（1～128 字符，仅允许字母、数字、`._:-`）。同一 `client_key` + `request_id` 在首次请求的窗口内只扣减一次，重试 / 并发请求回放首次结果；窗口结束后自动失效、可再次使用。不传时行为与旧版本一致 |
 | `limit` | 请求 | 单个窗口内允许累计的成本上限（≥1） |
-| `window_ms` | 请求 | 滑动窗口长度（毫秒，服务端限定 1～86400000） |
+| `window_ms` | 请求 | 滑动窗口长度（毫秒，服务端限定 1～86400000），同时决定幂等记录的存活时长 |
 | `cost` | 请求 | 本次成本（≥1，默认 1，且不得大于 `limit`） |
-| `remaining` | 响应 | 放行后窗口内剩余成本；超限时为未扣减情况下的剩余值 |
+| `request_id` | 响应 | 原样回显请求携带的幂等标识；未携带时为 `null` |
+| `idempotent_replay` | 响应 | `true` 表示本次为幂等回放（未重复扣减），响应头同时带 `Idempotent-Replay: true`；默认 `false` |
+| `remaining` | 响应 | 放行后窗口内剩余成本；超限时为未扣减情况下的剩余值；回放时为首次结果快照 |
 | `reset_at_ms` | 响应 | 窗口内最老一笔成本滑出、可再获配额的时刻（Redis 服务器时钟，Unix 毫秒） |
 | `retry_after_ms` | 响应 | 仅 429 时非 0：建议等待毫秒数；响应头同时给出标准 `Retry-After`（秒，向上取整） |
 
@@ -179,6 +210,17 @@ curl -s -X POST localhost:8000/v1/limits/check \
   不残留空窗口数据。
 - **超限语义**：超限时返回 `429`，响应体给出 `remaining`、`reset_at_ms`、
   `retry_after_ms`，并携带标准 `Retry-After` 头（秒，向上取整）。
+- **request_id 幂等**：携带 `request_id` 时，"幂等命中判定 → 清旧 → 累计 →
+  判定 → 扣减 → 记录完整响应"在**同一个 Lua 脚本**内完成，因此相同
+  `client_key` + `request_id` 的并发请求也只有首个完成判定与扣减，其余直接
+  回放首次结果（200 或 429 均会记录），回放响应带 `idempotent_replay=true`
+  与 `Idempotent-Replay: true` 响应头，且**不刷新任何 TTL**。幂等记录的 TTL
+  等于首次请求的 `window_ms`，窗口结束后自动删除——`request_id` 仅在对应窗口
+  内存活，跨窗口可再次使用。重试请求以首次结果为准，不重新判定额度或参数
+  （`limit` / `window_ms` 也回放首次值），发起新的逻辑请求请使用新的
+  `request_id`。幂等键以 `client_key` 长度定界，不同 `client_key` 间不可能
+  碰撞；`request_id` 仅允许字母、数字与 `._:-`，不携带 `request_id` 的请求
+  行为与旧版本完全一致。
 
 ### Redis 数据模型
 
@@ -187,6 +229,7 @@ curl -s -X POST localhost:8000/v1/limits/check \
 | `{prefix}:lease:{task_key}` | Hash（`token` / `fencing` / `expires_at`），带 PEXPIRE | 当前租约 |
 | `{prefix}:fencing:{task_key}` | String 计数器，无 TTL | 防栅序号，只增不减 |
 | `{limit_prefix}:{client_key}` | ZSet，score=请求毫秒时间戳，member=`<uuid>:<cost>`，带 PEXPIRE | 滑动窗口内各笔成本 |
+| `{idem_prefix}:<len>:{client_key}:{request_id}` | Hash（`allowed` / `remaining` / `reset_at` / `retry_after` / `limit` / `window`），PEXPIRE=首次 `window_ms` | request_id 首次判定的完整响应；窗口内回放、窗口结束自动删除 |
 
 ## 冒烟测试
 
@@ -199,7 +242,11 @@ python3 scripts/smoke_test.py            # 默认打 http://localhost:8000
 覆盖：获取冲突、错误令牌/序号被拒绝、防栅序号单调递增、旧持有者超时后无法
 续租/释放/干扰新租约等场景；以及限流的剩余额度递减、成本加权、超限 429
 （含 `Retry-After` 头与不扣减语义）、窗口滑动后恢复、**20 并发恰好放行
-limit 笔不超额**、参数校验和过期数据自动清理。
+limit 笔不超额**、参数校验和过期数据自动清理；以及 `request_id` 幂等：
+重试回放首次结果且不重复扣减、回放响应带 `Idempotent-Replay` 头、
+**20 个携带相同 request_id 的并发请求只扣减一次**、429 结果原样回放、
+`request_id` 跨窗口可再次使用、幂等作用域按 `client_key` 隔离、
+非法 `request_id` 返回 422。
 
 ## 本地开发（不用 Docker）
 
@@ -215,7 +262,7 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   config.py    # 环境变量配置（pydantic-settings）
-  lua.py       # 申请/批量申请/续租/释放/校验五个租约 Lua 脚本 + 滑动窗口限流 Lua 脚本
+  lua.py       # 申请/批量申请/续租/释放/校验五个租约 Lua 脚本 + 滑动窗口限流（含 request_id 幂等）Lua 脚本
   schemas.py   # 请求 / 响应模型
   main.py      # FastAPI 应用、路由、Redis 生命周期
 scripts/

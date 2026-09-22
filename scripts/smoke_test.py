@@ -8,7 +8,9 @@
 旧持有者在超时后无法影响新租约，以及批量申请的全成全败、
 冲突时不写不递增、过期接管与凭据兼容；以及滑动窗口成本限流的
 剩余额度 / 成本累计 / 超限 429 / 窗口滑动恢复 / 并发不超额 /
-参数校验 / 过期数据自动清理。
+参数校验 / 过期数据自动清理，以及 request_id 幂等：
+重试回放不重复扣减 / 并发相同 request_id 只扣一次 / 429 结果回放 /
+request_id 跨窗口可复用 / 非法 request_id 拒绝。
 """
 import json
 import sys
@@ -364,6 +366,167 @@ def limit_checks():
               remainings == list(range(0, 10)), f"{remainings}")
         check("concurrent denied retry_after present",
               all(r["retry_after_ms"] > 0 for r in denied), f"{denied[:2]}")
+
+    idempotency_checks()
+
+
+def idempotency_checks():
+    """request_id 幂等：回放不重复扣减 / 并发只扣一次 / 429 回放 / 跨窗口复用 / 校验。"""
+    base = f"smoke-idem:{int(time.time() * 1000)}"
+    path = "/v1/limits/check"
+
+    # 参数校验：空串 / 过长 / 含非法字符 -> 422
+    code, _ = call("POST", path, {"client_key": base, "limit": 10,
+                                  "window_ms": 10_000, "cost": 1,
+                                  "request_id": ""})
+    check("idem empty request_id -> 422", code == 422, f"code={code}")
+    code, _ = call("POST", path, {"client_key": base, "limit": 10,
+                                  "window_ms": 10_000, "cost": 1,
+                                  "request_id": "x" * 129})
+    check("idem long request_id -> 422", code == 422, f"code={code}")
+    code, _ = call("POST", path, {"client_key": base, "limit": 10,
+                                  "window_ms": 10_000, "cost": 1,
+                                  "request_id": "bad id/中"})
+    check("idem illegal chars request_id -> 422", code == 422, f"code={code}")
+
+    # 首次请求放行并回显 request_id；非回放不带 Idempotent-Replay
+    key = f"{base}:basic"
+    rid = "req-0001"
+    code, headers, b = call_ex("POST", path,
+                               {"client_key": key, "limit": 3, "window_ms": 10_000,
+                                "cost": 1, "request_id": rid})
+    check("idem first allow", code == 200 and b["allowed"]
+          and b["remaining"] == 2 and b["request_id"] == rid
+          and b["idempotent_replay"] is False, f"{code} {b}")
+    check("idem first no replay header",
+          headers.get("Idempotent-Replay") is None,
+          f"Idempotent-Replay={headers.get('Idempotent-Replay')}")
+
+    # 窗口内其他请求把额度打满（与 rid 无关，验证回放不受后续状态影响）
+    call("POST", path, {"client_key": key, "limit": 3,
+                        "window_ms": 10_000, "cost": 2})
+    # 此时真实额度已满；重试相同 request_id 必须回放首次结果（remaining=2）且不扣减
+    code, headers, b2 = call_ex("POST", path,
+                                {"client_key": key, "limit": 3, "window_ms": 10_000,
+                                 "cost": 1, "request_id": rid})
+    check("idem replay returns first result",
+          code == 200 and b2["allowed"] and b2["remaining"] == 2
+          and b2["reset_at_ms"] == b["reset_at_ms"]
+          and b2["request_id"] == rid and b2["idempotent_replay"] is True,
+          f"{code} first={b} replay={b2}")
+    check("idem replay header",
+          headers.get("Idempotent-Replay") == "true",
+          f"Idempotent-Replay={headers.get('Idempotent-Replay')}")
+
+    # 回放期间的重试参数不重新判定（limit/window 仍以首次记录为准）
+    code, b3 = call("POST", path,
+                    {"client_key": key, "limit": 99, "window_ms": 10_000,
+                     "cost": 1, "request_id": rid})
+    check("idem replay echoes first limit/window",
+          code == 200 and b3["idempotent_replay"] and b3["limit"] == 3
+          and b3["window_ms"] == 10_000, f"{code} {b3}")
+
+    # 不带 request_id 的普通请求不受影响：额度已满 -> 429
+    code, b4 = call("POST", path, {"client_key": key, "limit": 3,
+                                   "window_ms": 10_000, "cost": 1})
+    check("idem non-idem path still charged",
+          code == 429 and not b4["allowed"] and b4["request_id"] is None,
+          f"{code} {b4}")
+
+    # 429 结果同样被记录：先在新键打满窗口，再携带 request_id 请求被拒
+    dkey = f"{base}:denied"
+    call("POST", path, {"client_key": dkey, "limit": 2,
+                        "window_ms": 10_000, "cost": 2})
+    drid = "req-deny-1"
+    code, headers1, d1 = call_ex("POST", path,
+                                 {"client_key": dkey, "limit": 2, "window_ms": 10_000,
+                                  "cost": 1, "request_id": drid})
+    check("idem first deny -> 429",
+          code == 429 and not d1["allowed"] and d1["retry_after_ms"] > 0
+          and d1["idempotent_replay"] is False, f"{code} {d1}")
+    check("idem first deny Retry-After",
+          headers1.get("Retry-After") is not None,
+          f"Retry-After={headers1.get('Retry-After')}")
+    # 窗口滑出部分后重试：仍回放首次的 429（同一 reset_at_ms / retry_after_ms 快照）
+    code, headers2, d2 = call_ex("POST", path,
+                                 {"client_key": dkey, "limit": 2, "window_ms": 10_000,
+                                  "cost": 1, "request_id": drid})
+    check("idem denied replay",
+          code == 429 and d2["idempotent_replay"] is True
+          and d2["allowed"] is False
+          and d2["reset_at_ms"] == d1["reset_at_ms"]
+          and d2["retry_after_ms"] == d1["retry_after_ms"],
+          f"{code} first={d1} replay={d2}")
+    check("idem denied replay headers",
+          headers2.get("Idempotent-Replay") == "true"
+          and headers2.get("Retry-After") == headers1.get("Retry-After"),
+          f"h1={dict(headers1)} h2={dict(headers2)}")
+
+    # 并发相同 request_id：20 个并发只有 1 个完成扣减，其余全部回放首次结果
+    ckey = f"{base}:concurrent"
+    crid = "req-conc-1"
+    body = {"client_key": ckey, "limit": 10, "window_ms": 10_000,
+            "cost": 1, "request_id": crid}
+
+    def one_idem_hit(_):
+        return call_ex("POST", path, body)
+
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        cresults = list(pool.map(one_idem_hit, range(20)))
+    firsts = [d for _, h, d in cresults if d.get("idempotent_replay") is False]
+    replays = [d for _, h, d in cresults if d.get("idempotent_replay") is True]
+    check("idem concurrent single deduction",
+          len(firsts) == 1 and len(replays) == 19
+          and all(d["allowed"] and d["remaining"] == 9
+                  for _, _, d in cresults)
+          and all(d["reset_at_ms"] == firsts[0]["reset_at_ms"]
+                  for d in replays),
+          f"firsts={len(firsts)} replays={len(replays)}")
+    check("idem concurrent replay headers",
+          sum(1 for _, h, _ in cresults if h.get("Idempotent-Replay") == "true") == 19,
+          f"{[h.get('Idempotent-Replay') for _, h, _ in cresults]}")
+    # 实际只扣了一笔：不带 request_id 再请求一笔应放行且 remaining=8
+    code, after = call("POST", path, {"client_key": ckey, "limit": 10,
+                                      "window_ms": 10_000, "cost": 1})
+    check("idem concurrent total charged once",
+          code == 200 and after["allowed"] and after["remaining"] == 8,
+          f"{code} {after}")
+
+    # request_id 仅在对应窗口存活：800ms 窗口结束后同一 request_id 可再次使用，
+    # 且按新请求重新判定扣减
+    skey = f"{base}:sliding"
+    srid = "req-window-1"
+    code, s1 = call("POST", path,
+                    {"client_key": skey, "limit": 3, "window_ms": 800,
+                     "cost": 1, "request_id": srid})
+    check("idem short window first", code == 200 and s1["allowed"], f"{code} {s1}")
+    code, s2 = call("POST", path,
+                    {"client_key": skey, "limit": 3, "window_ms": 800,
+                     "cost": 1, "request_id": srid})
+    check("idem short window replay",
+          code == 200 and s2["idempotent_replay"] is True, f"{code} {s2}")
+    time.sleep(1.1)
+    code, s3 = call("POST", path,
+                    {"client_key": skey, "limit": 3, "window_ms": 800,
+                     "cost": 1, "request_id": srid})
+    check("idem request_id reusable across window",
+          code == 200 and s3["allowed"] and s3["idempotent_replay"] is False
+          and s3["remaining"] == 2
+          and s3["reset_at_ms"] != s1["reset_at_ms"], f"{code} {s3}")
+
+    # request_id 作用域为 client_key：不同 client_key 使用同一 request_id 互不影响
+    xkey, ykey = f"{base}:scope-a", f"{base}:scope-b"
+    shared_rid = "req-shared"
+    code, x1 = call("POST", path,
+                    {"client_key": xkey, "limit": 1, "window_ms": 10_000,
+                     "cost": 1, "request_id": shared_rid})
+    code, y1 = call("POST", path,
+                    {"client_key": ykey, "limit": 1, "window_ms": 10_000,
+                     "cost": 1, "request_id": shared_rid})
+    check("idem request_id scoped per client_key",
+          x1["allowed"] and y1["allowed"]
+          and x1["idempotent_replay"] is False
+          and y1["idempotent_replay"] is False, f"{x1} {y1}")
 
 
 if __name__ == "__main__":

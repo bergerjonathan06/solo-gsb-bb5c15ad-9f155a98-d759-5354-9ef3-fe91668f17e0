@@ -63,7 +63,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lease & Rate Limit API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "供多个工作进程协调独占任务的租约服务，以及基于 Redis Lua 的"
         "原子滑动窗口成本限流（FastAPI + Redis Lua）"
@@ -116,6 +116,15 @@ def resolve_ttl(ttl_ms: int | None, settings: Settings) -> int:
 
 def limit_key(settings: Settings, client_key: str) -> str:
     return f"{settings.limit_key_prefix}:{client_key}"
+
+
+def idempotency_key(settings: Settings, client_key: str, request_id: str) -> str:
+    # client_key 长度定界（4 位十六进制）后再拼接，保证不同 client_key
+    # 即使内容包含分隔符也不可能映射到同一个幂等键
+    length_tag = f"{len(client_key):04x}"
+    return (
+        f"{settings.limit_idem_key_prefix}:{length_tag}:{client_key}:{request_id}"
+    )
 
 
 def resolve_window(window_ms: int, settings: Settings) -> int:
@@ -295,7 +304,7 @@ async def inspect(
     "/v1/limits/check",
     response_model=LimitCheckResponse,
     tags=["rate-limits"],
-    summary="滑动窗口成本限流检查（通过即扣减）",
+    summary="滑动窗口成本限流检查（通过即扣减，支持 request_id 幂等）",
     responses={
         status.HTTP_429_TOO_MANY_REQUESTS: {"model": LimitCheckResponse},
     },
@@ -313,19 +322,60 @@ async def check_limit(
     - 超限：不扣减，返回 **429** 与 `retry_after_ms`（等待最老一笔成本滑出后重试），
       同时携带标准 `Retry-After` 响应头（秒）。
 
-    "清理旧记录 → 累计 → 判定 → 扣减"由单个 Lua 脚本基于 Redis 服务器时间
-    原子执行，同一 `client_key` 的并发请求不会超额；窗口数据随滑动自动清理，
-    键在窗口清空后按 `PEXPIRE` 自动删除。
+    **可选幂等（request_id）**：请求体携带 `request_id` 时，同一
+    `client_key` + `request_id` 在其首次请求的窗口内只判定 / 扣减一次，
+    首次结果（无论 200 还是 429）完整记录在 Redis 中；随后携带相同
+    `request_id` 的并发或重试请求直接回放首次结果，响应中
+    `idempotent_replay=true` 并携带 `Idempotent-Replay: true` 响应头，
+    **不会重复扣减、不刷新任何 TTL**。幂等记录的 TTL 等于首次请求的
+    `window_ms`，窗口结束后 `request_id` 自动失效、可再次使用。
+    重试请求以首次结果为准，不会重新判定参数与额度；需要发起新的逻辑
+    请求时请使用新的 `request_id`。不传 `request_id` 时行为与旧版本一致。
+
+    "幂等判定 → 清理旧记录 → 累计 → 判定 → 扣减 → 记录响应"由单个 Lua
+    脚本基于 Redis 服务器时间原子执行，同一 `client_key` 的并发请求不会
+    超额，相同 `request_id` 的并发请求只有首个完成扣减；窗口数据随滑动
+    自动清理，键在窗口清空后按 `PEXPIRE` 自动删除。
     """
     window = resolve_window(req.window_ms, settings)
+    keys = [limit_key(settings, req.client_key)]
+    if req.request_id is not None:
+        keys.append(idempotency_key(settings, req.client_key, req.request_id))
     result = await scripts.limit_check(
-        keys=[limit_key(settings, req.client_key)],
+        keys=keys,
         args=[req.limit, window, req.cost, uuid.uuid4().hex],
     )
-    if result[0]:
+
+    kind = result[0]
+    if kind == 2:
+        # 幂等命中：回放首次请求记录的完整结果
+        _, allowed_flag, remaining, reset_at_ms, retry_after_ms, stored_limit, stored_window = result
+        allowed = bool(allowed_flag)
+        replay = LimitCheckResponse(
+            allowed=allowed,
+            client_key=req.client_key,
+            request_id=req.request_id,
+            idempotent_replay=True,
+            limit=stored_limit,
+            window_ms=stored_window,
+            remaining=remaining,
+            reset_at_ms=reset_at_ms,
+            retry_after_ms=retry_after_ms,
+        )
+        response.headers["Idempotent-Replay"] = "true"
+        if not allowed:
+            response.status_code = status.HTTP_429_TOO_MANY_REQUESTS
+            # 标准 Retry-After 以秒为单位，向上取整避免客户端过早重试
+            response.headers["Retry-After"] = str(
+                max(1, math.ceil(retry_after_ms / 1000))
+            )
+        return replay
+
+    if kind == 1:
         return LimitCheckResponse(
             allowed=True,
             client_key=req.client_key,
+            request_id=req.request_id,
             limit=req.limit,
             window_ms=window,
             remaining=result[1],
@@ -339,6 +389,7 @@ async def check_limit(
     return LimitCheckResponse(
         allowed=False,
         client_key=req.client_key,
+        request_id=req.request_id,
         limit=req.limit,
         window_ms=window,
         remaining=remaining,
