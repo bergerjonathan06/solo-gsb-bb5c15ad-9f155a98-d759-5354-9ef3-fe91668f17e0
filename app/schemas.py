@@ -6,6 +6,9 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 BATCH_MIN_SIZE = 2
 BATCH_MAX_SIZE = 32
 
+# request_id 仅允许 URL/键安全字符（禁止 ':'，避免与 Redis 键分隔符冲突）
+REQUEST_ID_PATTERN = r"^[A-Za-z0-9_-]+$"
+
 TaskKey = Annotated[str, Field(min_length=1, max_length=512)]
 
 
@@ -146,6 +149,19 @@ class LimitCheckRequest(BaseModel):
         examples=[1],
         description="本次请求消耗的成本；不得大于 limit",
     )
+    request_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=REQUEST_ID_PATTERN,
+        examples=["req-01HZKX9B3P7M4D2Q8R6W5T1YVU"],
+        description=(
+            "可选幂等键：同一 client_key + 同一 request_id 在其对应窗口内"
+            "只做一次限额判定与扣减，重复（含并发）请求直接返回首次完整响应；"
+            "幂等记录随窗口过期，跨窗口该 request_id 可再次使用。"
+            "缺省时行为与旧版完全一致。"
+        ),
+    )
 
     @model_validator(mode="after")
     def cost_within_limit(self) -> "LimitCheckRequest":
@@ -173,4 +189,15 @@ class LimitCheckResponse(BaseModel):
         default=0,
         ge=0,
         description="仅超限时返回：建议等待毫秒数（至最老一笔成本滑出窗口）",
+    )
+    request_id: str | None = Field(
+        default=None,
+        description="回显请求携带的幂等键；未携带时不返回该字段",
+    )
+    idempotent_replay: bool = Field(
+        default=False,
+        description=(
+            "true 表示本次未做判定与扣减，返回的是同一 request_id "
+            "首次请求的缓存结果"
+        ),
     )

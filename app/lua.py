@@ -15,6 +15,9 @@
   uuid 保证同毫秒并发请求的 member 不冲突。
 - 窗口判断、累计、扣减全部基于 redis.call('TIME') 的服务器时间，
   单脚本原子执行，并发请求不会超额。
+- 可选 request_id 幂等：幂等键是 String，值为首次请求的完整响应 JSON，
+  TTL 等于窗口长度（与窗口同寿）；携带相同 request_id 的并发或重试请求
+  由同一脚本原子处理，只有首次判定会扣减，其余直接返回缓存结果。
 """
 
 # 申请租约：仅当租约不存在或已过期时成功。
@@ -158,17 +161,29 @@ end
 return {1, expires_at - now}
 """
 
-# 滑动窗口限流（成本累计）：原子完成"清旧 -> 累计 -> 判定 -> 扣减"。
+# 滑动窗口限流（成本累计）+ 可选 request_id 幂等，原子完成。
 # 限流键是一个 ZSet：score 为请求时刻（Redis 服务器毫秒），
 # member 形如 "<唯一标识>:<cost>"，同一毫秒内的并发请求也不会互相覆盖；
 # 每笔成本直接编码在 member 尾部，无需额外的键。
+# 幂等键是一个 String：值为首次请求完整响应的 JSON（cjson），
+# TTL 固定为首次请求的 window_ms，与窗口同寿；窗口过期后 request_id
+# 可再次使用。判定与缓存写入在同一脚本内完成，Redis 单线程串行执行，
+# 携带相同 request_id 的并发请求只有一个真正判定并 ZADD 扣减，
+# 其余直接读到首次结果。
 # KEYS[1] = 限流 ZSet 键
+# KEYS[2] = 幂等 String 键（未携带 request_id 时传入不会被使用的占位键，
+#           脚本不对其做任何读写）
 # ARGV[1] = limit（窗口内允许的成本上限）
 # ARGV[2] = window_ms
 # ARGV[3] = cost（本次请求成本）
 # ARGV[4] = 唯一标识（uuid hex，保证 member 不冲突）
-# 放行返回 {1, remaining, reset_at_ms}
-# 超限返回 {0, remaining, reset_at_ms, retry_after_ms}
+# ARGV[5] = 幂等键 TTL（毫秒）：携带 request_id 时为 window_ms，否则为 0
+# ARGV[6] = client_key（写入缓存 JSON 回显用）
+# ARGV[7] = request_id（写入缓存 JSON 回显用，未携带时为空串）
+# 幂等命中返回 {2, 完整响应 JSON 字符串}
+# 放行返回 {1, remaining, reset_at_ms, 完整响应 JSON}（启用幂等时已缓存）
+# 超限返回 {0, remaining, reset_at_ms, retry_after_ms, 完整响应 JSON}
+#   （启用幂等时拒绝结果同样缓存，重试直接回放首次拒绝）
 # reset_at_ms 为窗口内最老一笔成本滑出的时刻；窗口为空时取 now + window_ms。
 LIMIT_CHECK_LUA = """
 local t = redis.call('TIME')
@@ -176,7 +191,16 @@ local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local limit = tonumber(ARGV[1])
 local window = tonumber(ARGV[2])
 local cost = tonumber(ARGV[3])
+local idem_ttl = tonumber(ARGV[5])
 local key = KEYS[1]
+
+-- 幂等命中：直接返回首次请求缓存的完整响应，不判定、不扣减
+if idem_ttl > 0 then
+  local cached = redis.call('GET', KEYS[2])
+  if cached then
+    return {2, cached}
+  end
+end
 
 local window_start = now - window
 
@@ -198,12 +222,44 @@ else
   reset_at = tonumber(oldest[2]) + window
 end
 
+local payload
 if used + cost > limit then
-  return {0, limit - used, reset_at, reset_at - now}
+  local remaining = limit - used
+  local retry_after = reset_at - now
+  payload = cjson.encode({
+    allowed = false,
+    client_key = ARGV[6],
+    limit = limit,
+    window_ms = window,
+    cost = cost,
+    remaining = remaining,
+    reset_at_ms = reset_at,
+    retry_after_ms = retry_after,
+    request_id = ARGV[7]
+  })
+  -- 拒绝结果同样缓存，保证重试不重复判定且返回一致
+  if idem_ttl > 0 then
+    redis.call('SET', KEYS[2], payload, 'PX', idem_ttl)
+  end
+  return {0, remaining, reset_at, retry_after, payload}
 end
 
 redis.call('ZADD', key, now, ARGV[4] .. ':' .. cost)
 redis.call('PEXPIRE', key, window)
-return {1, limit - used - cost, reset_at}
+local remaining = limit - used - cost
+payload = cjson.encode({
+  allowed = true,
+  client_key = ARGV[6],
+  limit = limit,
+  window_ms = window,
+  cost = cost,
+  remaining = remaining,
+  reset_at_ms = reset_at,
+  retry_after_ms = 0,
+  request_id = ARGV[7]
+})
+if idem_ttl > 0 then
+  redis.call('SET', KEYS[2], payload, 'PX', idem_ttl)
+end
+return {1, remaining, reset_at, payload}
 """
-

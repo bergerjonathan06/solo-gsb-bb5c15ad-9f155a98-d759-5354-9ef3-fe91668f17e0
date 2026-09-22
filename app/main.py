@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import math
 import uuid
 from contextlib import asynccontextmanager
@@ -116,6 +117,11 @@ def resolve_ttl(ttl_ms: int | None, settings: Settings) -> int:
 
 def limit_key(settings: Settings, client_key: str) -> str:
     return f"{settings.limit_key_prefix}:{client_key}"
+
+
+def idempotency_key(settings: Settings, client_key: str, request_id: str) -> str:
+    # request_id 只允许 [A-Za-z0-9_-]，不含 ':'，与命名空间分隔符不会冲突
+    return f"{settings.limit_key_prefix}:idem:{client_key}:{request_id}"
 
 
 def resolve_window(window_ms: int, settings: Settings) -> int:
@@ -294,10 +300,12 @@ async def inspect(
 @app.post(
     "/v1/limits/check",
     response_model=LimitCheckResponse,
+    response_model_exclude_none=True,
     tags=["rate-limits"],
-    summary="滑动窗口成本限流检查（通过即扣减）",
+    summary="滑动窗口成本限流检查（通过即扣减，支持 request_id 幂等）",
     responses={
         status.HTTP_429_TOO_MANY_REQUESTS: {"model": LimitCheckResponse},
+        status.HTTP_409_CONFLICT: {"description": "request_id 已被参数不同的请求使用"},
     },
 )
 async def check_limit(
@@ -316,12 +324,79 @@ async def check_limit(
     "清理旧记录 → 累计 → 判定 → 扣减"由单个 Lua 脚本基于 Redis 服务器时间
     原子执行，同一 `client_key` 的并发请求不会超额；窗口数据随滑动自动清理，
     键在窗口清空后按 `PEXPIRE` 自动删除。
+
+    ### request_id 幂等
+
+    可选携带 `request_id`（同一 `client_key` 命名空间）：首次请求仍由上述 Lua
+    脚本**一次性原子完成**限额判定、扣减，并把**完整响应**（含 200/429 结果）
+    以 JSON 缓存在独立的幂等键上，TTL 等于本次窗口长度。携带相同
+    `request_id` 的并发或重试请求直接回放首次结果（响应中
+    `idempotent_replay=true`），**不会重复判定或重复扣减**，超限时同样回放
+    首次的 429 与 `Retry-After`。
+
+    - 幂等记录**只在对应窗口内存活**（PEXPIRE=window_ms）；窗口过期后
+      该 `request_id` 可在新窗口再次使用，重新正常判定与扣减。
+    - 相同 `request_id` 但 `limit` / `window_ms` / `cost` 与首次请求不一致时
+      返回 **409**（防止同一幂等键被语义不同的请求误用）。
+    - 不携带 `request_id` 时行为与旧版完全一致。
     """
     window = resolve_window(req.window_ms, settings)
+    rl_key = limit_key(settings, req.client_key)
+    if req.request_id is not None:
+        keys = [rl_key, idempotency_key(settings, req.client_key, req.request_id)]
+        idem_ttl = window
+    else:
+        # 占位键不会被脚本读写（ARGV[5]=0 时跳过幂等分支）
+        keys = [rl_key, f"{rl_key}:idem-unused"]
+        idem_ttl = 0
+
     result = await scripts.limit_check(
-        keys=[limit_key(settings, req.client_key)],
-        args=[req.limit, window, req.cost, uuid.uuid4().hex],
+        keys=keys,
+        args=[
+            req.limit,
+            window,
+            req.cost,
+            uuid.uuid4().hex,
+            idem_ttl,
+            req.client_key,
+            req.request_id or "",
+        ],
     )
+
+    if result[0] == 2:
+        # 幂等命中：回放首次请求的完整响应，参数不一致时返回 409
+        cached = json.loads(result[1])
+        if (
+            int(cached.get("cost")) != req.cost
+            or int(cached.get("limit")) != req.limit
+            or int(cached.get("window_ms")) != window
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "request_id was already used with a different "
+                    "limit/window_ms/cost"
+                ),
+            )
+        if not cached["allowed"]:
+            retry_after_ms = int(cached["retry_after_ms"])
+            response.status_code = status.HTTP_429_TOO_MANY_REQUESTS
+            # 与首次拒绝保持一致的标准 Retry-After（秒，向上取整）
+            response.headers["Retry-After"] = str(
+                max(1, math.ceil(retry_after_ms / 1000))
+            )
+        return LimitCheckResponse(
+            allowed=bool(cached["allowed"]),
+            client_key=req.client_key,
+            limit=req.limit,
+            window_ms=window,
+            remaining=int(cached["remaining"]),
+            reset_at_ms=int(cached["reset_at_ms"]),
+            retry_after_ms=int(cached.get("retry_after_ms", 0)),
+            request_id=req.request_id,
+            idempotent_replay=True,
+        )
+
     if result[0]:
         return LimitCheckResponse(
             allowed=True,
@@ -330,6 +405,7 @@ async def check_limit(
             window_ms=window,
             remaining=result[1],
             reset_at_ms=result[2],
+            request_id=req.request_id,
         )
 
     remaining, reset_at_ms, retry_after_ms = result[1], result[2], result[3]
@@ -344,4 +420,5 @@ async def check_limit(
         remaining=remaining,
         reset_at_ms=reset_at_ms,
         retry_after_ms=retry_after_ms,
+        request_id=req.request_id,
     )

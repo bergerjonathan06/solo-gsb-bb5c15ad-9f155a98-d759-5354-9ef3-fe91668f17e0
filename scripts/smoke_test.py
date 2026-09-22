@@ -8,7 +8,9 @@
 旧持有者在超时后无法影响新租约，以及批量申请的全成全败、
 冲突时不写不递增、过期接管与凭据兼容；以及滑动窗口成本限流的
 剩余额度 / 成本累计 / 超限 429 / 窗口滑动恢复 / 并发不超额 /
-参数校验 / 过期数据自动清理。
+参数校验 / 过期数据自动清理 / request_id 幂等（重试回放不重复扣减、
+并发同 request_id 只扣一次、拒绝也回放、参数不一致 409、跨窗口复用、
+不携带时保持兼容）。
 """
 import json
 import sys
@@ -149,6 +151,7 @@ def main():
 
     batch_checks()
     limit_checks()
+    idempotency_checks()
 
     print()
     if FAILED:
@@ -364,6 +367,155 @@ def limit_checks():
               remainings == list(range(0, 10)), f"{remainings}")
         check("concurrent denied retry_after present",
               all(r["retry_after_ms"] > 0 for r in denied), f"{denied[:2]}")
+
+
+def idempotency_checks():
+    """request_id 幂等：重试回放 / 并发只扣一次 / 拒绝回放 / 409 / 跨窗口复用。"""
+    base = f"smoke-idem:{int(time.time() * 1000)}"
+    path = "/v1/limits/check"
+    window = 10_000
+
+    # 1. 首次请求：放行并扣减，回显 request_id、idempotent_replay=false
+    ikey = f"{base}:basic"
+    body = {"client_key": ikey, "limit": 3, "window_ms": window,
+            "cost": 1, "request_id": "rid-first"}
+    code, b1 = call("POST", path, body)
+    check("idem first allow",
+          code == 200 and b1["allowed"] and b1["remaining"] == 2
+          and b1["request_id"] == "rid-first"
+          and b1["idempotent_replay"] is False, f"{code} {b1}")
+
+    # 2. 同 request_id 重试：完整回放首次结果，不重复扣减，replay=true
+    code, b2 = call("POST", path, dict(body))
+    check("idem retry replays first result",
+          code == 200 and b2["idempotent_replay"] is True
+          and b2["allowed"] == b1["allowed"]
+          and b2["remaining"] == b1["remaining"]
+          and b2["reset_at_ms"] == b1["reset_at_ms"],
+          f"first={b1} retry={b2}")
+
+    # 3. 回放不扣减：换新 request_id 再扣一笔，remaining 只可能是 1
+    #    （若上面的重试重复扣减，这里会是 0 或 429）
+    code, b3 = call("POST", path, {**body, "request_id": "rid-second"})
+    check("idem retry not charged twice",
+          code == 200 and b3["allowed"] and b3["remaining"] == 1,
+          f"{code} {b3}")
+
+    # 4. 相同 request_id 但参数不一致（cost）-> 409；limit/window 变体同样 409
+    code, b = call("POST", path, {**body, "cost": 2})
+    check("idem replay different cost -> 409", code == 409, f"{code} {b}")
+    code, b = call("POST", path, {**body, "limit": 99})
+    check("idem replay different limit -> 409", code == 409, f"{code} {b}")
+    code, b = call("POST", path, {**body, "window_ms": 20_000})
+    check("idem replay different window -> 409", code == 409, f"{code} {b}")
+    # 409 不影响后续正常回放
+    code, b = call("POST", path, dict(body))
+    check("idem replay after conflicts still works",
+          code == 200 and b["idempotent_replay"] is True
+          and b["remaining"] == 2, f"{code} {b}")
+
+    # 5. request_id 字符校验：只允许字母数字下划线连字符
+    code, b = call("POST", path, {**body, "request_id": "bad:rid"})
+    check("idem request_id bad charset -> 422", code == 422, f"{code}")
+
+    # 6. 首次即超限：429 也被缓存；重试回放同一拒绝、同一 Retry-After、不扣减
+    dkey = f"{base}:denied"
+    dbody = {"client_key": dkey, "limit": 1, "window_ms": window,
+             "cost": 1, "request_id": "rid-ok"}
+    code, _ = call("POST", path, dbody)
+    check("idem denied setup", code == 200, f"{code}")
+    code, h1, den1 = call_ex("POST", path,
+                             {**dbody, "request_id": "rid-denied"})
+    check("idem first deny -> 429",
+          code == 429 and not den1["allowed"]
+          and den1["idempotent_replay"] is False
+          and den1["retry_after_ms"] > 0, f"{code} {den1}")
+    code, h2, den2 = call_ex("POST", path,
+                             {**dbody, "request_id": "rid-denied"})
+    check("idem denied retry replays 429",
+          code == 429 and not den2["allowed"]
+          and den2["idempotent_replay"] is True
+          and den2["remaining"] == den1["remaining"]
+          and den2["reset_at_ms"] == den1["reset_at_ms"]
+          and den2["retry_after_ms"] == den1["retry_after_ms"],
+          f"{den1} vs {den2}")
+    check("idem denied retry Retry-After header",
+          h1.get("Retry-After") == h2.get("Retry-After")
+          and h2.get("Retry-After") is not None,
+          f"{h1.get('Retry-After')} vs {h2.get('Retry-After')}")
+
+    # 7. 并发相同 request_id：全部成功返回，只有 1 个真正判定，
+    #    其余全部回放；窗口只被扣减一次
+    ckey = f"{base}:concurrent"
+
+    def one_idem(i):
+        return call("POST", path,
+                    {"client_key": ckey, "limit": 10, "window_ms": window,
+                     "cost": 1, "request_id": "rid-concurrent"})
+
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        results = list(pool.map(one_idem, range(20)))
+    firsts = [r for code, r in results
+              if code == 200 and r["idempotent_replay"] is False]
+    replays = [r for code, r in results
+               if code == 200 and r["idempotent_replay"] is True]
+    check("idem concurrent single evaluation",
+          len(firsts) == 1 and len(replays) == 19,
+          f"firsts={len(firsts)} replays={len(replays)}")
+    check("idem concurrent identical payload",
+          len({(r["allowed"], r["remaining"], r["reset_at_ms"])
+               for _, r in results}) == 1, f"{results[:2]}")
+    # 只扣一次：新 request_id 请求后 remaining 应为 8（10 - 1 - 1）
+    code, b = call("POST", path,
+                   {"client_key": ckey, "limit": 10, "window_ms": window,
+                    "cost": 1, "request_id": "rid-after"})
+    check("idem concurrent charged once",
+          code == 200 and b["allowed"] and b["remaining"] == 8, f"{code} {b}")
+
+    # 8. 不同 client_key 使用同一 request_id 互不影响
+    code_a, ba = call("POST", path,
+                      {"client_key": f"{base}:tenantA", "limit": 1,
+                       "window_ms": window, "cost": 1, "request_id": "dup"})
+    code_b, bb = call("POST", path,
+                      {"client_key": f"{base}:tenantB", "limit": 1,
+                       "window_ms": window, "cost": 1, "request_id": "dup"})
+    check("idem request_id scoped per client_key",
+          code_a == 200 and code_b == 200
+          and ba["allowed"] and bb["allowed"]
+          and not ba["idempotent_replay"] and not bb["idempotent_replay"],
+          f"{ba} vs {bb}")
+
+    # 9. 跨窗口复用：短窗口内回放命中，窗口过期后同一 request_id 重新判定扣减
+    skey = f"{base}:reuse"
+    sbody = {"client_key": skey, "limit": 1, "window_ms": 800,
+             "cost": 1, "request_id": "rid-reuse"}
+    code, b = call("POST", path, sbody)
+    check("idem reuse first", code == 200 and b["allowed"]
+          and not b["idempotent_replay"], f"{code} {b}")
+    code, b = call("POST", path, dict(sbody))
+    check("idem reuse replay in window",
+          code == 200 and b["idempotent_replay"], f"{code} {b}")
+    time.sleep(1.0)
+    code, b = call("POST", path, dict(sbody))
+    check("idem reuse after window expiry re-evaluates",
+          code == 200 and b["allowed"] and not b["idempotent_replay"]
+          and b["remaining"] == 0, f"{code} {b}")
+
+    # 10. 不携带 request_id：响应不包含 request_id 字段，且各自独立扣减（兼容旧版）
+    nkey = f"{base}:no-rid"
+    code, b = call("POST", path,
+                   {"client_key": nkey, "limit": 2, "window_ms": window,
+                    "cost": 1})
+    check("idem absent request_id backward compat",
+          code == 200 and b["allowed"] and b["remaining"] == 1
+          and "request_id" not in b and b["idempotent_replay"] is False,
+          f"{code} {b}")
+    code, b = call("POST", path,
+                   {"client_key": nkey, "limit": 2, "window_ms": window,
+                    "cost": 1})
+    check("idem absent request_id still charges each call",
+          code == 200 and b["allowed"] and b["remaining"] == 0,
+          f"{code} {b}")
 
 
 if __name__ == "__main__":
